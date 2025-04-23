@@ -1,0 +1,104 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers
+from sklearn.preprocessing import MinMaxScaler
+import datetime as dt
+import matplotlib.pyplot as plt
+
+# ----------- Positional Encoding -----------
+def positional_encoding(position, d_model):
+    angle_rads = np.arange(position)[:, np.newaxis] / np.power(10000, (2 * (np.arange(d_model)[np.newaxis, :] // 2)) / np.float32(d_model))
+    angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+    angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+    return tf.cast(angle_rads, dtype=tf.float32)
+
+# ----------- Self-Attention Layer -----------
+class TimeSeriesSelfAttention(layers.Layer):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)
+        self.norm = layers.LayerNormalization()
+        self.ff = tf.keras.Sequential([
+            layers.Dense(d_model * 4, activation="relu"),
+            layers.Dense(d_model)
+        ])
+
+    def call(self, x):
+        attn_output = self.mha(x, x)
+        x = self.norm(x + attn_output)
+        ff_output = self.ff(x)
+        return self.norm(x + ff_output)
+
+# ----------- Modelo Transformer -----------
+def build_transformer_model(input_shape, d_model=64, num_heads=4, num_layers=2):
+    inputs = tf.keras.Input(shape=input_shape)
+    x = layers.Dense(d_model)(inputs)
+    x += positional_encoding(input_shape[0], d_model)
+
+    for _ in range(num_layers):
+        x = TimeSeriesSelfAttention(d_model, num_heads)(x)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    outputs = layers.Dense(1)(x)
+    return tf.keras.Model(inputs, outputs)
+
+# ----------- Preparar los datos -----------
+file_path = 'bitcoin_2020-02-16_2025-02-14.csv'
+df = pd.read_csv(file_path)
+df['Start'] = pd.to_datetime(df['Start'])
+df.sort_values('Start', inplace=True)
+close_prices = df['Close'].values.reshape(-1, 1)
+
+scaler = MinMaxScaler()
+scaled_close = scaler.fit_transform(close_prices)
+
+sequence_length = 60
+x_data, y_data = [], []
+for i in range(sequence_length, len(scaled_close)):
+    x_data.append(scaled_close[i-sequence_length:i])
+    y_data.append(scaled_close[i])
+
+x_data, y_data = np.array(x_data), np.array(y_data)
+
+# ----------- Compilar y entrenar modelo -----------
+model = build_transformer_model(input_shape=(sequence_length, 1))
+model.compile(optimizer='adam', loss='mse')
+model.fit(x_data, y_data, epochs=20, batch_size=32)
+
+# ----------- Predicción multistep -----------
+ultima_fecha = df['Start'].max().date()
+fecha_objetivo = input("Ingresa una fecha futura (YYYY-MM-DD): ")
+fecha_objetivo = dt.datetime.strptime(fecha_objetivo, '%Y-%m-%d').date()
+
+dias_a_predecir = (fecha_objetivo - ultima_fecha).days
+if dias_a_predecir <= 0:
+    print("La fecha debe ser posterior al último dato registrado.")
+    exit()
+
+last_60_days = scaled_close[-sequence_length:]
+predictions = []
+
+for _ in range(dias_a_predecir):
+    input_seq = np.reshape(last_60_days, (1, sequence_length, 1))
+    predicted_scaled_price = model.predict(input_seq, verbose=0)
+    predictions.append(predicted_scaled_price[0, 0])
+    last_60_days = np.append(last_60_days, predicted_scaled_price)[-sequence_length:]
+
+predicted_price = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+
+# ----------- Resultado -----------
+print(f"Predicción del precio de cierre de Bitcoin para {fecha_objetivo}: ${predicted_price[-1][0]:,.2f}")
+
+# ----------- Visualización -----------
+fechas_predichas = [ultima_fecha + dt.timedelta(days=i+1) for i in range(dias_a_predecir)]
+plt.figure(figsize=(12, 6))
+plt.plot(df['Start'][-100:], df['Close'].values[-100:], label='Histórico')
+plt.plot(fechas_predichas, predicted_price, label='Predicción (Transformer)', color='orange')
+plt.title('Predicción futura del precio de cierre de Bitcoin (Transformer)')
+plt.xlabel('Fecha')
+plt.ylabel('Precio USD')
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
